@@ -21,37 +21,57 @@ const gdrive = drive({
   auth: auth,
 });
 
+/**
+ * Delete old backups in Shared Drive
+ */
 const deleteStaleBackups = async (cutOffDate: Date) => {
-  const folderAccess = await gdrive.files.get({
-    fileId: env.FOLDER_ID,
-    fields: "id",
-  });
+  try {
+    // Check access to folder
+    const folderAccess = await gdrive.files.get({
+      fileId: env.FOLDER_ID,
+      fields: "id",
+      supportsAllDrives: true,  // ✅ Supports Shared Drives
+    });
 
-  if (!folderAccess.data.id) {
-    console.error(`No access to FOLDER_ID: ${env.FOLDER_ID}`);
-    return;
-  }
+    if (!folderAccess.data.id) {
+      console.error(`No access to FOLDER_ID: ${env.FOLDER_ID}`);
+      return;
+    }
 
-  const res = await gdrive.files.list({
-    pageSize: 100,
-    fields: "nextPageToken, files(id, createdTime)",
-    q: `'${env.FOLDER_ID}' in parents and trashed=false and mimeType = 'application/gzip' and createdTime < '${cutOffDate.toISOString()}'`,
-  });
+    // List old backup files in the folder
+    const res = await gdrive.files.list({
+      pageSize: 100,
+      fields: "nextPageToken, files(id, createdTime)",
+      q: `'${env.FOLDER_ID}' in parents and trashed=false and mimeType = 'application/gzip' and createdTime < '${cutOffDate.toISOString()}'`,
+      includeItemsFromAllDrives: true,  // ✅ Supports Shared Drives
+      supportsAllDrives: true,  // ✅ Supports Shared Drives
+    });
 
-  if (!res.data.files) {
-    return;
-  }
+    if (!res.data.files) {
+      return;
+    }
 
-  for (const file of res.data.files) {
-    if (!file.id) continue;
-    await gdrive.files.delete({ fileId: file.id });
+    for (const file of res.data.files) {
+      if (!file.id) continue;
+      await gdrive.files.delete({
+        fileId: file.id,
+        supportsAllDrives: true,  // ✅ Supports Shared Drives
+      });
+    }
+
+    console.log("Old backups deleted successfully.");
+  } catch (error) {
+    console.error("Error deleting stale backups:", error);
   }
 };
 
-const dumpToFile = async (path: string) => {
+/**
+ * Dump PostgreSQL database to a file
+ */
+const dumpToFile = async (filePath: string) => {
   return new Promise((resolve, reject) => {
     exec(
-      `pg_dump --dbname=${env.DATABASE_URL} --format=tar | gzip > ${path}`,
+      `pg_dump --dbname=${env.DATABASE_URL} --format=tar | gzip > ${filePath}`,
       (err, stdout, stderr) => {
         if (err) {
           reject({
@@ -65,7 +85,7 @@ const dumpToFile = async (path: string) => {
           console.log(stderr.trimEnd());
         }
 
-        const isFileValid = execSync(`gzip -cd ${path} | head -c1`).length > 0;
+        const isFileValid = execSync(`gzip -cd ${filePath} | head -c1`).length > 0;
 
         if (!isFileValid) {
           console.error("Backup file is empty");
@@ -73,12 +93,8 @@ const dumpToFile = async (path: string) => {
           return;
         }
 
-        console.log(`Backup file size: ${filesize(statSync(path).size)}`);
-        console.log(`Backup file created at: ${path}`);
-
-        if (stdout) {
-          console.log(stdout);
-        }
+        console.log(`Backup file size: ${filesize(statSync(filePath).size)}`);
+        console.log(`Backup file created at: ${filePath}`);
 
         resolve(stdout);
       },
@@ -86,62 +102,80 @@ const dumpToFile = async (path: string) => {
   });
 };
 
-const pushToDrive = async (filename: string, path: string) => {
-  const folderAccess = await gdrive.files.get({
-    fileId: env.FOLDER_ID,
-    fields: "id",
-  });
+/**
+ * Upload backup to Google Drive (Shared Drive supported)
+ */
+const pushToDrive = async (filename: string, filePath: string) => {
+  try {
+    // Check access to the folder
+    const folderAccess = await gdrive.files.get({
+      fileId: env.FOLDER_ID,
+      fields: "id",
+      supportsAllDrives: true,  // ✅ Supports Shared Drives
+    });
 
-  if (!folderAccess.data.id) {
-    console.error(`No access to FOLDER_ID: ${env.FOLDER_ID}`);
-    return;
+    if (!folderAccess.data.id) {
+      console.error(`No access to FOLDER_ID: ${env.FOLDER_ID}`);
+      return;
+    }
+
+    // File metadata
+    const fileMetadata = {
+      name: filename,
+      parents: [env.FOLDER_ID],
+    };
+
+    // File upload settings
+    const media = {
+      mimeType: "application/gzip",
+      body: createReadStream(filePath),
+    };
+
+    // Upload file
+    await gdrive.files.create({
+      requestBody: fileMetadata,
+      media: media,
+      supportsAllDrives: true,  // ✅ Supports Shared Drives
+    });
+
+    console.log(`Backup ${filename} uploaded successfully.`);
+  } catch (error) {
+    console.error("Error uploading to Google Drive:", error);
   }
-
-  const fileMetadata = {
-    name: filename,
-    parents: [env.FOLDER_ID],
-  };
-
-  const media = {
-    mimeType: "application/gzip",
-    body: createReadStream(path),
-  };
-
-  await gdrive.files.create({
-    requestBody: fileMetadata,
-    media: media,
-  });
 };
 
+/**
+ * Main function: Runs the full backup process
+ */
 export async function run() {
   try {
     if (env.RETENTION && env.RETENTION !== "disabled") {
       console.log(`Deleting old backups older than a ${env.RETENTION}`);
       const cutOffDate = dayjs().subtract(1, env.RETENTION).toDate();
       await deleteStaleBackups(cutOffDate);
-      console.log(`Delete complete! Procceding with backup.`);
+      console.log("Delete complete! Proceeding with backup.");
     }
 
+    // Generate backup file name
     const timestamp = new Date()
       .toISOString()
       .replace(/:/g, "-")
       .replace(".", "-");
 
     const filename = `${env.FILE_PREFIX}${timestamp}.tar.gz`;
+    const filePath = path.join(os.tmpdir(), filename);
 
-    const filepath = path.join(os.tmpdir(), filename);
+    console.log(`Starting backup: ${filename}`);
 
-    console.log(`Starting backup of ${filename}`);
-
-    await dumpToFile(filepath);
+    await dumpToFile(filePath);
 
     console.log("Backup done! Uploading to Google Drive...");
 
-    await pushToDrive(filename, filepath);
+    await pushToDrive(filename, filePath);
 
     console.log("Backup uploaded to Google Drive!");
 
-    await unlink(filepath);
+    await unlink(filePath);
 
     console.log("All done!");
   } catch (err) {
