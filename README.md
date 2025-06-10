@@ -1,4 +1,4 @@
-# Postgres Personal GDrive Backup
+# /Postgres Personal GDrive Backup
 Backup a Postgres database to your Personal Google Drive.
 
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/16Nb5i?referralCode=doiska)
